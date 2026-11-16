@@ -23,7 +23,7 @@ This is the distinction between finding a value and explaining a row. A retained
 
 The program reads `sqlite_schema` and looks up column, index, and foreign-key metadata in batches. Table and column names are used to address records and report findings. Values supply the evidence. SQLite values have their own storage types, so a column's declared type does not rule it out. The catalog accepts a table count limit after optional name filters. With no explicit count limit, time still limits how far it can get. [SQLite schema table](https://www.sqlite.org/schematab.html) · [Table-valued PRAGMAs](https://www.sqlite.org/pragma.html#pragfunc) · [SQLite datatypes](https://www.sqlite.org/datatype3.html)
 
-In the default bounded mode, one short query identifies empty tables. Across the nonempty tables, the program first checks eligible indexes for up to three priority values. It favors values that repeat less in the frontend sample and uses value type and length to break ties. Those are hints about which checks to run first. The source frequencies are unknown. It then reads limited head and tail samples, makes a few rowid seeks where available, and probes indexes for the remaining values. A small table already covered by the sample needs no further index probes.
+In the default bounded mode, one short query identifies empty tables. The first index pass takes up to three values from each GUI table, drawn from values that occur only once across the input samples. It favors text and BLOBs, then longer representations. A second index pass checks the remaining values that occur once. Both passes run before sampling, so rows containing common values are less likely to fill the evidence store before the indexed targets are reached. The program then reads limited head and tail samples and makes a few rowid seeks where available. It probes indexes for repeated values in tables whose samples did not cover every row. Frontend frequency helps choose the order. The source frequencies are unknown.
 
 Index probes bind values and use the index's collation. If multiple indexes cover a column, `BINARY` is preferred because the value comparison is case-sensitive. The program checks that SQLite reports a `SEARCH` access path before executing an index probe. Actual values are checked again in Python. [SQLite collations](https://www.sqlite.org/datatype3.html#collation) · [EXPLAIN QUERY PLAN](https://www.sqlite.org/eqp.html)
 
@@ -55,7 +55,9 @@ Column candidates come from observed hits. In a join search, the foreign-key gra
 
 The program tries alternative field mappings under explicit limits. For repeated GUI rows, it uses **bipartite matching** to assign distinct source records. Think of a graph with GUI rows on the left and eligible source records on the right. A link means that record agrees with the row under the mapping. The algorithm can reassign an earlier row when doing so lets both rows use different valid records. Reusing one record twice would overstate the evidence.
 
-A layout can be partial if a displayed field has no viable source column or some rows could not be verified. A structural finding generally needs at least two sample records and four confirmed cells, with lower thresholds for smaller samples. The individual-value section lists evidence that does not meet those thresholds.
+A layout can be partial if a displayed field has no viable source column or some records could not be verified. For rows and transposition, the program requires evidence from at least two records and two fields in the orientation being checked, when the sample has that many. It also requires four confirmed cells when at least four non-NULL cells are available. A sample with one non-NULL field can still produce a layout. For a larger sample, evidence confined to one field is available under **Individual field matches**.
+
+Each mapping tries to assign every field with a candidate. If an unrelated source column supplies a candidate for a field, the search can miss a valid partial mapping that would omit that field. In `WITHOUT ROWID` tables, the first sample can follow a covering index. The tail uses descending primary-key order when SQLite can provide it without sorting.
 
 ## Time and space complexity
 
@@ -72,7 +74,7 @@ Use the following quantities when estimating a run:
 | Stage | Cost and what drives it |
 | --- | --- |
 | Catalog | Work grows at least linearly with the table, column, index, and foreign-key entries inspected. Batching reduces SQL calls while SQLite still has to examine the schema. Empty tables require one data check each in bounded mode. |
-| Indexed search | Up to `I × K` logical probes, plus an access-plan check per probed column. In table `t`, a B-tree seek is approximately `O(log N_t)`. Each probe may fetch up to `W` candidate rows, with `O(W × C_t)` cell checks in the worst case. Index collation, selectivity, and disk cache affect elapsed time. |
+| Indexed search | Ranking the `K` distinct values takes `O(K log K)` comparisons. Across all passes, the tool issues up to `I × K` logical probes, plus an access-plan check per probed column. In table `t`, a B-tree seek is approximately `O(log N_t)`. Each probe may fetch up to `W` candidate rows, with `O(W × C_t)` cell checks in the worst case. Index collation, selectivity, and disk cache affect elapsed time. |
 | Bounded sampling | With `J` additional rowid seeks per table, up to `S + 4J` sampled records per table. Comparing their cells costs approximately `O(sum_t((S + J) × C_t))`, plus the seeks. Confirmation for an indexed EAV entity adds the cost of an index seek per ID and the matching records visited. |
 | Exhaustive search | The initial discovery pass visits each row. Worst-case cell work is `Theta(sum_t(N_t × C_t))`, even when very few result rows reach Python. Query limits can interrupt that pass. |
 | Mapping and row checks | If a layout has `P` positions with up to `B` candidates each, there can be up to `B^P` combinations before injectivity and other constraints. The program caps the number of mappings and search states. For each mapping, it verifies records from the shortest posting list for each row. The augmenting-path matcher takes up to `O(U × A)` time after the eligible pairs have been found. |
@@ -113,7 +115,7 @@ The HTML displays verified layouts, coverage, the GUI sample, and individual val
 
 Replay SQL uses the recorded locations and emits verified cells in GUI order. Unverified cells become NULL placeholders. The SQL is a recipe for checking the sample. Record locators may change after source maintenance. Keep reports under the same access controls as the source data.
 
-**Not found within budget** means the search found no witness within its scope. Check the coverage for uninspected tables, empty tables, truncated probes, and other limits before interpreting the result.
+**Not found within budget** means the search found no witness within its scope. Check the coverage for uninspected tables, empty tables, truncated probes, and other limits before interpreting the result. **All rows examined** means a completed scan or a sample covering the entire table without hitting the evidence limit. Witness and mapping limits can still restrict the layouts reported.
 
 ### Change the search budget
 
@@ -180,7 +182,7 @@ The empty-table comparison uses the same two-by-two sample. The large number of 
 python3 -m unittest discover -s tests -v
 ```
 
-The test cases include a page of repeated colors preceding the target records, common EAV values recovered through entity IDs, join candidates among 30 lookalike tables, binary and case-insensitive indexes on the same column, and partial evidence. Generated databases and reports are ignored by Git.
+The tests cover repeated colors, single-field matches, multiple GUI samples competing for the evidence budget, incomplete sampling at the row and byte limits, EAV lookups by entity ID, join candidates among lookalike tables, and index collations. Generated databases and reports are ignored by Git.
 
 ## License
 

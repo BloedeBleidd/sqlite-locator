@@ -77,7 +77,14 @@ class Integration(unittest.TestCase):
                 )
                 rows = con.execute(finding["replay_sql"]).fetchall()
                 if finding["full"]:
-                    self.assertEqual(len(rows), len(front["rows"]))
+                    self.assertEqual(
+                        [row[0] for row in rows],
+                        [
+                            r
+                            for r, row in enumerate(front["rows"], 1)
+                            if any(value is not None for value in row)
+                        ],
+                    )
                 for row in rows:
                     expected = front["rows"][row[0] - 1]
                     verified = {
@@ -412,6 +419,94 @@ class Integration(unittest.TestCase):
         self.assertEqual((f["matched_cells"], f["total_cells"]), (4, 6))
         self.assert_replays(p)
 
+    def test_repeated_flag_alone_is_only_individual_evidence(self):
+        self.prepare(
+            [(f"apple-{i}", 100 + i, 1) for i in range(5)],
+            "CREATE TABLE noise(flag, label);",
+            [("INSERT INTO noise VALUES (?,?)", [(1, f"noise-{i}") for i in range(8)])],
+            labels=["Name", "Quantity", "Active"],
+        )
+        with contextlib.closing(sqlite3.connect(self.front)) as con, con:
+            con.executescript(
+                "CREATE TABLE baseline(a,b,c,d); INSERT INTO baseline VALUES "
+                "(1,1,1,1),('Rare-A','Rare-B','Rare-C','Rare-D');"
+            )
+        p = self.run_finder()
+        self.assertEqual(p["findings"], [])
+        self.assertTrue(
+            any(
+                m["frontend"] == "gui" and m["frontend_column"] == "Active"
+                for m in p["column_matches"]
+            )
+        )
+
+    def test_partial_layout_needs_proofs_for_multiple_active_fields(self):
+        self.prepare(
+            [(1, None)] * 4 + [("Rare-A", "Rare-B")],
+            "CREATE TABLE t(x,y); INSERT INTO t VALUES "
+            "(1,NULL),(1,NULL),(1,NULL),(1,NULL),('Rare-A',NULL),(NULL,'Rare-B');",
+        )
+        p = self.run_finder()
+        self.assertEqual(p["findings"], [])
+
+    def test_single_active_field_supports_a_complete_layout(self):
+        self.prepare(
+            [("Rare-A", None), ("Rare-B", None)],
+            "CREATE TABLE t(x); INSERT INTO t VALUES ('Rare-A'),('Rare-B');",
+        )
+        with contextlib.closing(sqlite3.connect(self.front)) as con, con:
+            con.executescript(
+                "CREATE TABLE rotated(a,b); INSERT INTO rotated VALUES "
+                "('Rare-A','Rare-B'),(NULL,NULL);"
+            )
+        p = self.run_finder()
+        self.assertEqual(
+            {(f["frontend"], f["kind"]) for f in p["findings"] if f["full"]},
+            {("gui", "rows"), ("rotated", "transpose")},
+        )
+        self.assert_replays(p)
+
+    def test_indexed_values_for_multiple_samples_precede_background_noise(self):
+        apples = [
+            ("Golden Russet Reserve A-418", 126, 1),
+            ("Granny Smith Heritage GS-762", 137, 1),
+            ("Idared Estate Collection ID-412", 152, 1),
+            ("Gala GA-418", 166, 1),
+            ("Fuji F-73", 178, 1),
+        ]
+        sensors = [("SENSOR-X7/LAB", 263), ("SENSOR-B4/LAB", 571)]
+        self.prepare(
+            apples,
+            "CREATE TABLE a_noise(x,y); "
+            "CREATE TABLE z_apples(x,y,z); CREATE INDEX apple_name ON z_apples(x); "
+            "CREATE TABLE z_sensors(x,y); CREATE INDEX sensor_name ON z_sensors(x);",
+            [
+                ("INSERT INTO a_noise VALUES (?,?)", [(None, 1)] * 16),
+                ("INSERT INTO z_apples VALUES (?,?,?)", apples),
+                ("INSERT INTO z_sensors VALUES (?,?)", sensors),
+            ],
+        )
+        with contextlib.closing(sqlite3.connect(self.front)) as con, con:
+            con.execute("CREATE TABLE Sensors(name, reading)")
+            con.executemany("INSERT INTO Sensors VALUES (?,?)", sensors)
+
+        p = self.run_finder("--max-evidence-rows", "10")
+        self.assertEqual(
+            {(f["frontend"], tuple(f["tables"])) for f in p["findings"] if f["full"]},
+            {("gui", ("z_apples",)), ("Sensors", ("z_sensors",))},
+        )
+        self.assert_replays(p)
+
+        # A later-ranked apple name can also be common in the source. The
+        # sensor anchors should already have been checked when this probe runs.
+        with contextlib.closing(sqlite3.connect(self.source)) as con, con:
+            con.execute("UPDATE a_noise SET x=?", (apples[3][0],))
+            con.execute("CREATE INDEX noise_name ON a_noise(x)")
+        p = self.run_finder("--max-evidence-rows", "10")
+        self.assertTrue(
+            any(f["frontend"] == "Sensors" and f["full"] for f in p["findings"])
+        )
+
     def test_join_candidates_survive_many_earlier_category_tables(self):
         self.prepare(
             [("Gala GA-418", "red"), ("Granny Smith", "green")],
@@ -511,6 +606,30 @@ class Integration(unittest.TestCase):
             any("--max-evidence-rows" in n for n in p["metadata"]["operational_notes"])
         )
 
+    def test_evidence_capacity_marks_partial_head_and_tail_samples(self):
+        for phase, values, size, examined in (
+            ("head", ["anchor", "unseen"] + ["noise"] * 48, 160, 1),
+            ("tail", ["noise"] * 3 + ["unseen", "anchor"], 6, 4),
+        ):
+            with self.subTest(phase=phase):
+                self.front = self.base / f"{phase}-front.sqlite"
+                self.source = self.base / f"{phase}-source.sqlite"
+                self.prepare(
+                    [("anchor",), ("unseen",)],
+                    "CREATE TABLE t(x);",
+                    [("INSERT INTO t VALUES (?)", [(v,) for v in values])],
+                )
+                p = self.run_finder(
+                    "--max-evidence-rows", "1", "--sample-rows", str(size)
+                )
+                coverage = p["coverage"][0]
+                self.assertEqual(coverage["sample_rows"], examined)
+                self.assertFalse(coverage["all_rows_sampled"])
+                self.assertNotIn("All rows examined", self.report.read_text())
+                self.assertEqual(
+                    p["frontends"][0]["cells"][1]["status"], "not found within budget"
+                )
+
     def test_alternative_transpose_mapping(self):
         # Lexically first full column-set assignment is wrong; the second is coherent.
         self.prepare(
@@ -557,6 +676,8 @@ class Integration(unittest.TestCase):
         )
         p = self.run_finder("--max-evidence-bytes", "1")
         self.assertEqual(p["findings"], [])
+        self.assertFalse(p["coverage"][0]["all_rows_sampled"])
+        self.assertNotIn("All rows examined", self.report.read_text())
         self.assertTrue(
             all(
                 c["status"] == "not found within budget"

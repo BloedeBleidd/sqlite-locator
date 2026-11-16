@@ -579,13 +579,17 @@ class EvidenceStore:
         self.codec, self.config = codec, config
         self.targets: dict[Key, Value] = {}
         self.target_frequency: Counter[Key] = Counter()
+        self.frontend_keys: list[set[Key]] = []
         for front in fronts:
+            keys: set[Key] = set()
             for row in front.rows:
                 for value in row:
                     key = codec.key(value)
                     if key is not None:
                         self.targets.setdefault(key, value)
                         self.target_frequency[key] += 1
+                        keys.add(key)
+            self.frontend_keys.append(keys)
         self.rows: dict[str, dict[tuple, Witness]] = defaultdict(dict)
         self.hits: dict[Ref, dict[Key, set[tuple]]] = defaultdict(
             lambda: defaultdict(set)
@@ -651,7 +655,7 @@ class EvidenceStore:
 
 
 class ProbeEngine:
-    PRIORITY_VALUES = 3
+    PRIORITY_VALUES_PER_FRONTEND = 3
 
     def __init__(self, db: SQLiteReader, store: EvidenceStore):
         self.db, self.store, self.cfg = db, store, db.config
@@ -669,18 +673,11 @@ class ProbeEngine:
                 self.full_scan(table, coverage)
             return
 
-        # Prioritize values that repeat less in the frontend. Text and BLOB
-        # lengths break ties. Neither statistic measures source frequencies.
-        def priority(key: Key) -> tuple:
-            value = self.store.targets[key]
-            return (
-                self.store.target_frequency[key],
-                not isinstance(value, (str, bytes)),
-                -(len(value) if isinstance(value, (str, bytes)) else len(str(value))),
-            )
-
-        ranked = sorted(self.store.targets, key=priority)
-        params = {k: self.store.codec.variants(self.store.targets[k]) for k in ranked}
+        priority, remaining, repeated = self.index_probe_groups()
+        params = {
+            key: self.store.codec.variants(value)
+            for key, value in self.store.targets.items()
+        }
         self.probe_width = max(map(len, params.values()))
         for variants in params.values():
             variants.extend([None] * (self.probe_width - len(variants)))
@@ -709,9 +706,15 @@ class ProbeEngine:
                 coverage.empty = True
                 continue
             active.append((table, coverage, indices))
-            self.probe_indices(
-                table, coverage, indices, ranked[: self.PRIORITY_VALUES], params
-            )
+            self.probe_indices(table, coverage, indices, priority, params)
+
+        # Try the remaining values seen once before broad samples can fill the
+        # store with repeated values.
+        if remaining:
+            for table, coverage, indices in active:
+                if self.stopped():
+                    return
+                self.probe_indices(table, coverage, indices, remaining, params)
 
         for table, coverage, _ in active:
             if self.stopped():
@@ -723,9 +726,44 @@ class ProbeEngine:
             if self.stopped():
                 return
             if not coverage.all_rows_sampled:
-                self.probe_indices(
-                    table, coverage, indices, ranked[self.PRIORITY_VALUES :], params
-                )
+                self.probe_indices(table, coverage, indices, repeated, params)
+
+    def index_probe_groups(self) -> tuple[list[Key], list[Key], list[Key]]:
+        # Frontend frequency and value length only suggest selectivity. The
+        # actual frequency in the source is unknown.
+        def priority(key: Key) -> tuple:
+            value = self.store.targets[key]
+            is_text_or_blob = isinstance(value, (str, bytes))
+            return (
+                self.store.target_frequency[key],
+                not is_text_or_blob,
+                -(len(value) if is_text_or_blob else len(str(value))),
+            )
+
+        ranked = sorted(self.store.targets, key=priority)
+        selective = {
+            key: rank
+            for rank, key in enumerate(ranked)
+            if self.store.target_frequency[key] == 1
+        }
+        by_frontend = [
+            sorted(keys & selective.keys(), key=selective.__getitem__)[
+                : self.PRIORITY_VALUES_PER_FRONTEND
+            ]
+            for keys in self.store.frontend_keys
+        ]
+        first = [
+            key
+            for group in itertools.zip_longest(*by_frontend)
+            for key in group
+            if key is not None
+        ]
+        first_set = set(first)
+        return (
+            first,
+            [key for key in selective if key not in first_set],
+            [key for key in ranked if key not in selective],
+        )
 
     def stopped(self) -> bool:
         if self.store.capacity_limit:
@@ -794,7 +832,7 @@ class ProbeEngine:
         prefix = table.select_sql()
         unique = set()
 
-        def retain(result: QueryResult) -> None:
+        def retain(result: QueryResult) -> bool:
             if not result.complete:
                 coverage.interrupted += 1
             for row in result.rows:
@@ -802,14 +840,15 @@ class ProbeEngine:
                 if not self.store.add(table, row):
                     break
             coverage.sample_rows = len(unique)
+            return result.complete and not self.store.capacity_limit
 
         # LIMIT without random sorting; both ends of the rowid/PRIMARY KEY index.
         head_n = (self.cfg.sample_rows + 1) // 2
         tail_n = self.cfg.sample_rows // 2
         head_sql = prefix + ((" ORDER BY " + order) if table.rowid else "") + " LIMIT ?"
         head = self.db.run(head_sql, [head_n], limit=head_n)
-        retain(head)
-        coverage.all_rows_sampled = head.complete and head.count < head_n
+        head_examined = retain(head)
+        coverage.all_rows_sampled = head_examined and head.count < head_n
         if coverage.all_rows_sampled or not tail_n or self.stopped():
             return
         tail_order = ", ".join(qi(c) + " DESC" for c in table.locator)
@@ -822,9 +861,9 @@ class ProbeEngine:
                 )
                 return
         tail = self.db.run(tail_sql, [tail_n], limit=tail_n)
-        if table.rowid and head.rows and tail.rows and head.complete and tail.complete:
+        tail_examined = retain(tail)
+        if table.rowid and head_examined and tail_examined and head.rows and tail.rows:
             coverage.all_rows_sampled = head.rows[-1][0] >= tail.rows[-1][0]
-        retain(tail)
         if coverage.all_rows_sampled:
             return
         if table.rowid and head.rows and tail.rows:
@@ -999,11 +1038,16 @@ class StructureMatcher:
             LOGGER.info("Verifying structures for: %s", front.name)
             for transpose in (False, True):
                 rows, coords = self.view(front, transpose)
+                min_fields = min(
+                    2, sum(any(v is not None for v in col) for col in zip(*rows))
+                )
                 candidates = self.column_candidates(rows)
                 for name in sorted(candidates):
                     if self.db.deadline.expired():
                         break
                     options = self.options(candidates, [name])
+                    if len(options) < min_fields:
+                        continue
                     if sum(row[j] is not None for row in rows for j in options) < min(
                         4, front.cells
                     ):
@@ -1021,6 +1065,7 @@ class StructureMatcher:
                             [],
                             mapping,
                             "transpose" if transpose else "rows",
+                            min_fields=min_fields,
                         )
                     if count >= self.cfg.max_mappings:
                         self.notes.add(
@@ -1093,6 +1138,8 @@ class StructureMatcher:
         edges: list[Edge],
         mapping: dict[int, Ref],
         kind: str,
+        *,
+        min_fields: int = 2,
     ) -> None:
         choices: dict[int, list[Hashable]] = {}
         evidence: dict[tuple[int, Hashable], list[CellProof]] = {}
@@ -1211,8 +1258,13 @@ class StructureMatcher:
         ]
         if len(proofs) < min(4, front.cells):
             return
+        proven_fields = {p.row if kind == "transpose" else p.column for p in proofs}
+        if len(proven_fields) < min_fields:
+            return
         descriptions = []
         for j, (name, c) in sorted(mapping.items()):
+            if j not in proven_fields:
+                continue
             label = f"GUI row {j + 1}" if kind == "transpose" else front.columns[j]
             descriptions.append(f"{label} → {name}.{self.tables[name].columns[c].name}")
         note = "Shared records verified; duplicate GUI rows mapped to distinct source records."
