@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import heapq
 import html
 import itertools
 import json
@@ -36,7 +37,6 @@ Value = Any  # SQLite: None, int, float, str, bytes.
 Key = tuple[str, Hashable]
 Ref = tuple[str, int]  # table name, column position (not its name or declared type)
 LOGGER = logging.getLogger("sqlite_locator")
-VERSION = "1.0.0"
 
 
 def qi(name: str) -> str:
@@ -148,7 +148,7 @@ class Config:
     max_evidence_bytes: int = 67108864
     max_row_bytes: int = 4194304
     max_hit_rows: int = 20000
-    max_tables: int = 10000
+    max_tables: int = 0
     max_columns: int = 256
     max_frontend_rows: int = 100
     max_frontend_cells: int = 400
@@ -172,6 +172,11 @@ class Column:
     declared_type: str
     pk_order: int = 0
     index: str | None = None  # None = no usable index, '' = INTEGER PRIMARY KEY.
+    collation: str = "BINARY"
+
+    @property
+    def index_expression(self) -> str:
+        return qi(self.name) + " COLLATE " + self.collation
 
 
 @dataclass
@@ -190,6 +195,10 @@ class Table:
             prefix + qi(c) for c in self.locator + [c.name for c in self.columns]
         )
 
+    def select_sql(self, index: str | None = None) -> str:
+        hint = " INDEXED BY " + qi(index) if index else ""
+        return "SELECT " + self.select_list() + " FROM " + qi(self.name) + hint
+
 
 @dataclass
 class FrontTable:
@@ -206,8 +215,12 @@ class FrontTable:
 class Coverage:
     table: str
     columns: int
+    started: bool = False
+    empty: bool = False
+    all_rows_sampled: bool = False
     sample_rows: int = 0
     index_probes: int = 0
+    entity_probes: int = 0
     retained_rows: int = 0
     full_scan_finished: bool = False
     truncated_probes: int = 0
@@ -303,7 +316,7 @@ class SQLiteReader:
         params: Iterable[Value] = (),
         *,
         limit: int = 10000,
-        consume: Callable[[tuple], None] | None = None,
+        consume: Callable[[tuple], bool] | None = None,
     ) -> QueryResult:
         result = QueryResult()
         if self.deadline.expired():
@@ -327,7 +340,12 @@ class SQLiteReader:
                     break
                 result.count += 1
                 if consume:
-                    consume(row)
+                    if not consume(row):
+                        result.complete, result.reason = (
+                            False,
+                            "evidence capacity reached",
+                        )
+                        break
                 else:
                     result.rows.append(row)
                 if time.monotonic() >= end:
@@ -351,48 +369,101 @@ class SQLiteReader:
 
 
 class Catalog:
+    BATCH_SIZE = 128
+
     def __init__(self, db: SQLiteReader):
         self.db = db
         self.notes: list[str] = []
 
-    def read(self, patterns: list[str] | None = None) -> dict[str, Table]:
-        cfg = self.db.config
-        result = self.db.run(
-            "SELECT name, sql FROM sqlite_schema WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%'",
-            limit=cfg.max_tables,
-        )
-        if not result.complete:
-            self.notes.append("Catalog read incomplete: " + result.reason)
+    def read(
+        self, patterns: list[str] | None = None, *, limit: int = 0
+    ) -> dict[str, Table]:
         tables = {}
-        for name, ddl in result.rows:
-            if self.db.deadline.expired():
-                self.notes.append("Time limit reached while reading the schema.")
-                break
-            if patterns and not any(fnmatch.fnmatchcase(name, p) for p in patterns):
-                continue
-            if re.search(r"CREATE\s+VIRTUAL\s+TABLE", ddl or "", re.I):
-                self.notes.append(f"{name}: virtual table skipped.")
-                continue
-            info = self.db.run(
-                "SELECT name, type, pk, hidden FROM pragma_table_xinfo(?)",
-                [name],
-                limit=cfg.max_columns,
+        after = None
+        selected = 0
+        while not self.db.deadline.expired():
+            lower_bound = "" if after is None else " AND rowid>?"
+            result = self.db.run(
+                "SELECT rowid, name, sql FROM sqlite_schema WHERE type='table' "
+                "AND substr(name,1,7)<>'sqlite_'"
+                + lower_bound
+                + " ORDER BY rowid LIMIT ?",
+                [self.BATCH_SIZE] if after is None else [after, self.BATCH_SIZE],
+                limit=self.BATCH_SIZE,
             )
-            if not info.complete:
+            batch = {}
+            limited = False
+            for after, name, ddl in result.rows:
+                if patterns and not any(fnmatch.fnmatchcase(name, p) for p in patterns):
+                    continue
+                if re.search(r"^\s*CREATE\s+VIRTUAL\s+TABLE\b", ddl or "", re.I):
+                    self.notes.append(f"{name}: virtual table skipped.")
+                    continue
+                if limit and selected >= limit:
+                    limited = True
+                    break
+                batch[name] = ddl
+                selected += 1
+            if batch:
+                tables.update(self.read_batch(batch))
+            if limited:
                 self.notes.append(
-                    f"{name}: incomplete column metadata ({info.reason}); skipped."
+                    f"Catalog stopped at --max-tables={limit}. Additional matching tables were not inspected."
                 )
+                break
+            if not result.complete:
+                self.notes.append("Catalog read incomplete: " + result.reason)
+                break
+            if len(result.rows) < self.BATCH_SIZE:
+                break
+        if self.db.deadline.expired():
+            self.notes.append(
+                "Time limit reached while reading the source or frontend schema."
+            )
+        return tables
+
+    def read_batch(self, batch: dict[str, str]) -> dict[str, Table]:
+        cfg = self.db.config
+        names = list(batch)
+        prefix = "WITH batch(name) AS (VALUES " + ",".join("(?)" for _ in names) + ") "
+        columns_result = self.db.run(
+            prefix + "SELECT batch.name, c.cid, c.name, c.type, c.pk, c.hidden "
+            "FROM batch CROSS JOIN pragma_table_xinfo(batch.name) AS c "
+            "WHERE c.cid<=?",
+            [*names, cfg.max_columns],
+            limit=len(names) * (cfg.max_columns + 1),
+        )
+        if not columns_result.complete:
+            if len(names) > 1 and not self.db.deadline.expired():
+                middle = len(names) // 2
+                return self.read_batch(
+                    {n: batch[n] for n in names[:middle]}
+                ) | self.read_batch({n: batch[n] for n in names[middle:]})
+            self.notes.append(
+                f"Column metadata incomplete for a batch of {len(names)} tables "
+                f"starting at {names[0]}: {columns_result.reason}. Batch skipped."
+            )
+            return {}
+        column_rows: dict[str, list[tuple]] = defaultdict(list)
+        for name, *info in columns_result.rows:
+            column_rows[name].append(info)
+        tables = {}
+        for name, ddl in batch.items():
+            info = column_rows[name]
+            if len(info) > cfg.max_columns:
+                self.notes.append(f"{name}: exceeds --max-columns; skipped.")
                 continue
             columns = [
-                Column(n, t or "", pk) for n, t, pk, hidden in info.rows if hidden != 1
+                Column(n, t or "", pk)
+                for _, n, t, pk, hidden in sorted(info)
+                if hidden != 1
             ]
             if not columns:
                 continue
-            names = {c.name.casefold() for c in columns}
+            column_names = {c.name.casefold() for c in columns}
             without = bool(re.search(r"\bWITHOUT\s+ROWID\b", ddl or "", re.I))
             rowid = next(
-                (x for x in ["_rowid_", "rowid", "oid"] if x not in names), None
+                (x for x in ["_rowid_", "rowid", "oid"] if x not in column_names), None
             )
             if without:
                 rowid = None
@@ -403,52 +474,64 @@ class Catalog:
             if not locator:
                 self.notes.append(f"{name}: no unambiguous row locator; skipped.")
                 continue
-            table = Table(name, columns, locator, rowid)
-            indices = self.db.run(
-                "SELECT name, origin, partial FROM pragma_index_list(?)", [name]
-            )
-            if not indices.complete:
-                self.notes.append(f"{name}: incomplete index metadata.")
-            for index_name, origin, partial in indices.rows:
-                if partial:
-                    continue
-                idx = self.db.run(
-                    "SELECT name, coll FROM pragma_index_xinfo(?) "
-                    "WHERE key=1 ORDER BY seqno",
-                    [index_name],
-                )
-                if (
-                    idx.complete
-                    and idx.rows
-                    and idx.rows[0][1] in ("BINARY", "NOCASE", "RTRIM")
-                ):
-                    for c in columns:
-                        if c.name == idx.rows[0][0] and c.index is None:
-                            c.index = index_name
             # INTEGER PRIMARY KEY DESC may have its own index; verify the plan later.
             if len(primary) == 1 and rowid:
                 for c in columns:
-                    if (
-                        c.pk_order
-                        and c.declared_type.upper() == "INTEGER"
-                        and c.index is None
-                    ):
+                    if c.pk_order and c.declared_type.upper() == "INTEGER":
                         c.index = ""
-            fks = self.db.run(
-                'SELECT id, seq, "table", "from", "to" '
-                "FROM pragma_foreign_key_list(?) ORDER BY id, seq",
-                [name],
+            tables[name] = Table(name, columns, locator, rowid)
+        if not tables:
+            return tables
+
+        indices = self.db.run(
+            prefix + "SELECT batch.name, i.name, x.name, x.coll FROM batch "
+            "CROSS JOIN pragma_index_list(batch.name) AS i "
+            "CROSS JOIN pragma_index_xinfo(i.name) AS x "
+            'WHERE i.partial=0 AND x.seqno=0 AND x."key"=1',
+            names,
+        )
+        if not indices.complete:
+            self.notes.append(
+                f"Incomplete index metadata starting at {names[0]}: {indices.reason}."
             )
-            groups: dict[int, list] = defaultdict(list)
-            for fk_id, seq, target, source_col, target_col in fks.rows:
-                groups[fk_id].append((target, source_col, target_col))
-            table.foreign_keys = [
-                (rows[0][0], [r[1] for r in rows], [r[2] for r in rows])
-                for rows in groups.values()
-            ]
+        columns_by_name = {
+            (table.name, c.name): c for table in tables.values() for c in table.columns
+        }
+        for name, index_name, leading, collation in indices.rows:
+            col = columns_by_name.get((name, leading))
+            collation = (collation or "").upper()
+            if col is None or collation not in ("BINARY", "NOCASE", "RTRIM"):
+                continue
+            if col.index in (None, "") or (
+                collation == "BINARY" and col.collation != "BINARY"
+            ):
+                col.index, col.collation = index_name, collation
+
+        if cfg.max_join_hops:
+            fks = self.db.run(
+                prefix + 'SELECT batch.name, f.id, f.seq, f."table", f."from", f."to" '
+                "FROM batch CROSS JOIN pragma_foreign_key_list(batch.name) AS f",
+                names,
+            )
             if not fks.complete:
-                self.notes.append(f"{name}: incomplete foreign-key metadata.")
-            tables[name] = table
+                self.notes.append(
+                    f"Incomplete foreign-key metadata starting at {names[0]}: {fks.reason}. "
+                    "Foreign keys in this batch were skipped."
+                )
+            else:
+                groups: dict[tuple[str, int], list[tuple]] = defaultdict(list)
+                for name, fk_id, seq, target, left, right in fks.rows:
+                    if name in tables:
+                        groups[(name, fk_id)].append((seq, target, left, right))
+                for (name, _), rows in groups.items():
+                    ordered = sorted(rows)
+                    tables[name].foreign_keys.append(
+                        (
+                            ordered[0][1],
+                            [r[2] for r in ordered],
+                            [r[3] for r in ordered],
+                        )
+                    )
         return tables
 
 
@@ -495,177 +578,261 @@ class EvidenceStore:
     def __init__(self, codec: ValueCodec, fronts: list[FrontTable], config: Config):
         self.codec, self.config = codec, config
         self.targets: dict[Key, Value] = {}
+        self.target_frequency: Counter[Key] = Counter()
         for front in fronts:
             for row in front.rows:
                 for value in row:
                     key = codec.key(value)
                     if key is not None:
                         self.targets.setdefault(key, value)
+                        self.target_frequency[key] += 1
         self.rows: dict[str, dict[tuple, Witness]] = defaultdict(dict)
         self.hits: dict[Ref, dict[Key, set[tuple]]] = defaultdict(
             lambda: defaultdict(set)
         )
+        self.references: dict[Key, set[Ref]] = defaultdict(set)
         self.count = 0
         self.payload_bytes = 0
-        self.capped = False
+        self.occurrences_limited = False
+        self.capacity_limit: str | None = None
         self.oversized = False
 
-    def add(self, table: Table, raw: tuple) -> None:
+    def add(self, table: Table, raw: tuple, *, entity_match: bool = False) -> bool:
+        """Admit a witness and index all of its matching cells."""
+        if self.capacity_limit:
+            return False
         n = len(table.locator)
         loc, values = tuple(raw[:n]), tuple(raw[n:])
-        if loc in self.rows[table.name]:
-            return
+        if loc in self.rows.get(table.name, {}):
+            return True
         if any(
             isinstance(v, (str, bytes)) and len(v) > self.config.max_value_bytes
             for v in values
         ):
             self.oversized = True
-            return
+            return True
         keys = [self.codec.key(v) for v in values]
         useful = [(i, key) for i, key in enumerate(keys) if key in self.targets]
         if not useful:
-            return
+            return True
+        # An already retained row must appear in every posting for its matching
+        # cells. Use the occurrence limit for admission, never for verification.
+        if not entity_match and all(
+            self.bucket_full((table.name, i), key) for i, key in useful
+        ):
+            self.occurrences_limited = True
+            return True
         size = (
             sys.getsizeof(values)
             + sys.getsizeof(loc)
             + sum(sys.getsizeof(v) for v in values + loc)
         )
-        if (
-            self.count >= self.config.max_evidence_rows
-            or self.payload_bytes + size > self.config.max_evidence_bytes
-        ):
-            self.capped = True
-            return
-        # A per-value/column cap prevents a common '1' from exhausting memory.
-        if all(
-            len(self.hits[(table.name, i)][k]) >= self.config.witnesses
-            for i, k in useful
-        ):
-            self.capped = True
-            return
+        if self.payload_bytes + size > self.config.max_evidence_bytes:
+            self.capacity_limit = "--max-evidence-bytes"
+            return False
         self.rows[table.name][loc] = Witness(loc, values)
         self.count += 1
         self.payload_bytes += size
         for i, key in useful:
-            bucket = self.hits[(table.name, i)][key]
-            if len(bucket) < self.config.witnesses:
-                bucket.add(loc)
-            else:
-                self.capped = True
+            ref = table.name, i
+            self.hits[ref][key].add(loc)
+            self.references[key].add(ref)
+        if self.count == self.config.max_evidence_rows:
+            self.capacity_limit = "--max-evidence-rows"
+        elif self.payload_bytes == self.config.max_evidence_bytes:
+            self.capacity_limit = "--max-evidence-bytes"
+        return self.capacity_limit is None
 
-    def coverage(self, ref: Ref, values: Iterable[Value]) -> float:
-        keys = {self.codec.key(v) for v in values if v is not None}
-        return len(keys & self.hits.get(ref, {}).keys()) / len(keys) if keys else 0.0
+    def bucket_full(self, ref: Ref, key: Key) -> bool:
+        return len(self.hits.get(ref, {}).get(key, ())) >= self.config.witnesses
+
+    def matches(self, value: Value) -> int:
+        return int(self.codec.key(value) in self.targets)
 
 
 class ProbeEngine:
+    PRIORITY_VALUES = 3
+
     def __init__(self, db: SQLiteReader, store: EvidenceStore):
         self.db, self.store, self.cfg = db, store, db.config
         self.rng = random.Random(self.cfg.seed)
-        self.coverage: list[Coverage] = []
+        self.coverage: dict[str, Coverage] = {}
+        self.plans: dict[Ref, str | None] = {}
+        self.stop_reason: str | None = None
 
     def run(self, tables: dict[str, Table]) -> None:
-        # Value complexity is a priority heuristic, not a measurement of rarity.
-        targets = sorted(
-            self.store.targets.values(),
-            key=lambda v: (isinstance(v, (str, bytes)), len(str(v))),
-            reverse=True,
-        )
+        if self.cfg.mode == "exhaustive":
+            for table in tables.values():
+                if self.stopped():
+                    break
+                coverage = self.start(table)
+                self.full_scan(table, coverage)
+            return
+
+        # Prioritize values that repeat less in the frontend. Text and BLOB
+        # lengths break ties. Neither statistic measures source frequencies.
+        def priority(key: Key) -> tuple:
+            value = self.store.targets[key]
+            return (
+                self.store.target_frequency[key],
+                not isinstance(value, (str, bytes)),
+                -(len(value) if isinstance(value, (str, bytes)) else len(str(value))),
+            )
+
+        ranked = sorted(self.store.targets, key=priority)
+        params = {k: self.store.codec.variants(self.store.targets[k]) for k in ranked}
+        self.probe_width = max(map(len, params.values()))
+        for variants in params.values():
+            variants.extend([None] * (self.probe_width - len(variants)))
+
+        active = []
         for number, table in enumerate(tables.values(), 1):
-            coverage = Coverage(table.name, len(table.columns))
-            self.coverage.append(coverage)
-            if self.db.deadline.expired():
-                coverage.notes.append("Not started: global time limit.")
+            if self.stopped():
+                return
+            indices = [
+                i for i, col in enumerate(table.columns) if col.index is not None
+            ]
+            if not indices and not self.cfg.sample_rows:
                 continue
             if number == 1 or number % 25 == 0:
-                LOGGER.info("Probing table %s/%s: %s", number, len(tables), table.name)
-            if self.cfg.mode == "exhaustive":
-                self.full_scan(table, coverage)
-            else:
+                LOGGER.info(
+                    "Checking priority values in table %s/%s: %s",
+                    number,
+                    len(tables),
+                    table.name,
+                )
+            coverage = self.start(table)
+            check = self.db.run(f"SELECT 1 FROM {qi(table.name)} LIMIT 1", limit=1)
+            if not check.complete:
+                coverage.interrupted += 1
+            elif not check.rows:
+                coverage.empty = True
+                continue
+            active.append((table, coverage, indices))
+            self.probe_indices(
+                table, coverage, indices, ranked[: self.PRIORITY_VALUES], params
+            )
+
+        for table, coverage, _ in active:
+            if self.stopped():
+                return
+            if self.cfg.sample_rows:
                 self.sample(table, coverage)
-                for i, col in enumerate(table.columns):
-                    if col.index is None or self.db.deadline.expired():
-                        continue
-                    force = " INDEXED BY " + qi(col.index) if col.index else ""
-                    prototype = (
-                        "SELECT "
-                        + table.select_list()
-                        + " FROM "
-                        + qi(table.name)
-                        + force
+
+        for table, coverage, indices in active:
+            if self.stopped():
+                return
+            if not coverage.all_rows_sampled:
+                self.probe_indices(
+                    table, coverage, indices, ranked[self.PRIORITY_VALUES :], params
+                )
+
+    def stopped(self) -> bool:
+        if self.store.capacity_limit:
+            self.stop_reason = "Evidence capacity reached."
+        elif self.db.deadline.expired():
+            self.stop_reason = "Discovery time limit reached; remaining time reserved for verification."
+        return self.stop_reason is not None
+
+    def start(self, table: Table) -> Coverage:
+        coverage = Coverage(table.name, len(table.columns), started=True)
+        self.coverage[table.name] = coverage
+        return coverage
+
+    def probe_indices(
+        self,
+        table: Table,
+        coverage: Coverage,
+        indices: list[int],
+        keys: list[Key],
+        params: dict[Key, list[Value]],
+    ) -> None:
+        for i in indices:
+            ref = table.name, i
+            col = table.columns[i]
+            for key in keys:
+                if self.stopped():
+                    return
+                if self.store.bucket_full(ref, key):
+                    continue
+                bindings = [*params[key], self.cfg.witnesses + 1]
+                if ref not in self.plans:
+                    sql = (
+                        table.select_sql(col.index)
                         + " WHERE "
-                        + qi(col.name)
-                        + "=?"
+                        + col.index_expression
+                        + " IN ("
+                        + ",".join("?" for _ in range(self.probe_width))
+                        + ") LIMIT ?"
                     )
-                    plan = self.db.run("EXPLAIN QUERY PLAN " + prototype, [targets[0]])
-                    if not plan.complete or not any(
-                        "SEARCH " in str(r[-1]) for r in plan.rows
-                    ):
+                    self.plans[ref] = (
+                        sql if confirms_search(self.db, sql, bindings) else None
+                    )
+                    if self.plans[ref] is None:
                         coverage.notes.append(
                             f"{col.name}: indexed search could not be confirmed."
                         )
-                        continue
-                    for value in targets:
-                        if self.db.deadline.expired():
-                            break
-                        key = self.store.codec.key(value)
-                        if (
-                            len(self.store.hits.get((table.name, i), {}).get(key, ()))
-                            >= self.cfg.witnesses
-                        ):
-                            continue
-                        variants = self.store.codec.variants(value)
-                        sql = (
-                            "SELECT "
-                            + table.select_list()
-                            + " FROM "
-                            + qi(table.name)
-                            + force
-                            + " WHERE "
-                            + qi(col.name)
-                            + " IN ("
-                            + ",".join("?" for _ in variants)
-                            + ") LIMIT ?"
-                        )
-                        result = self.db.run(
-                            sql,
-                            variants + [self.cfg.witnesses + 1],
-                            limit=self.cfg.witnesses,
-                            consume=lambda row: self.store.add(table, row),
-                        )
-                        coverage.index_probes += 1
-                        if not result.complete:
-                            coverage.truncated_probes += 1
-                            if result.reason != "returned row limit":
-                                coverage.interrupted += 1
-            coverage.retained_rows = len(self.store.rows.get(table.name, {}))
+                sql = self.plans[ref]
+                if sql is None:
+                    break
+                result = self.db.run(
+                    sql,
+                    bindings,
+                    limit=self.cfg.witnesses,
+                    consume=lambda row: self.store.add(table, row),
+                )
+                coverage.index_probes += 1
+                if not result.complete:
+                    coverage.truncated_probes += 1
+                    if result.reason == "returned row limit":
+                        self.store.occurrences_limited = True
+                    elif result.reason != "evidence capacity reached":
+                        coverage.interrupted += 1
 
     def sample(self, table: Table, coverage: Coverage) -> None:
-        if self.cfg.sample_rows == 0:
-            return
         order = ", ".join(map(qi, table.locator))
-        prefix = "SELECT " + table.select_list() + " FROM " + qi(table.name)
-        # LIMIT without random sorting; both ends of the rowid/PRIMARY KEY index.
-        head_n = (self.cfg.sample_rows + 1) // 2
-        tail_n = self.cfg.sample_rows // 2
-        head = self.db.run(
-            prefix + " ORDER BY " + order + " LIMIT ?", [head_n], limit=head_n
-        )
-        tail_order = ", ".join(qi(c) + " DESC" for c in table.locator)
-        tail = self.db.run(
-            prefix + " ORDER BY " + tail_order + " LIMIT ?", [tail_n], limit=tail_n
-        )
+        prefix = table.select_sql()
         unique = set()
-        for result in (head, tail):
+
+        def retain(result: QueryResult) -> None:
             if not result.complete:
                 coverage.interrupted += 1
             for row in result.rows:
                 unique.add(tuple(row[: len(table.locator)]))
-                self.store.add(table, row)
+                if not self.store.add(table, row):
+                    break
+            coverage.sample_rows = len(unique)
+
+        # LIMIT without random sorting; both ends of the rowid/PRIMARY KEY index.
+        head_n = (self.cfg.sample_rows + 1) // 2
+        tail_n = self.cfg.sample_rows // 2
+        head_sql = prefix + ((" ORDER BY " + order) if table.rowid else "") + " LIMIT ?"
+        head = self.db.run(head_sql, [head_n], limit=head_n)
+        retain(head)
+        coverage.all_rows_sampled = head.complete and head.count < head_n
+        if coverage.all_rows_sampled or not tail_n or self.stopped():
+            return
+        tail_order = ", ".join(qi(c) + " DESC" for c in table.locator)
+        tail_sql = prefix + " ORDER BY " + tail_order + " LIMIT ?"
+        if not table.rowid:
+            plan = self.db.run("EXPLAIN QUERY PLAN " + tail_sql, [tail_n])
+            if not plan.complete or any("TEMP B-TREE" in row[-1] for row in plan.rows):
+                coverage.notes.append(
+                    "Tail sample skipped because its order could require a sort."
+                )
+                return
+        tail = self.db.run(tail_sql, [tail_n], limit=tail_n)
+        if table.rowid and head.rows and tail.rows and head.complete and tail.complete:
+            coverage.all_rows_sampled = head.rows[-1][0] >= tail.rows[-1][0]
+        retain(tail)
+        if coverage.all_rows_sampled:
+            return
         if table.rowid and head.rows and tail.rows:
             low, high = head.rows[0][0], tail.rows[0][0]
             if high > low:
                 for _ in range(self.cfg.random_seeks):
+                    if self.stopped():
+                        return
                     position = self.rng.randint(low, high)
                     result = self.db.run(
                         prefix
@@ -677,38 +844,13 @@ class ProbeEngine:
                         [position],
                         limit=4,
                     )
-                    for row in result.rows:
-                        unique.add((row[0],))
-                        self.store.add(table, row)
-                    if not result.complete:
-                        coverage.interrupted += 1
-        elif not table.rowid:
-            coverage.notes.append(
-                "WITHOUT ROWID: samples from both ends of the primary key, without random seeks."
-            )
-        coverage.sample_rows = len(unique)
-        coverage.notes.append(
-            "Sampling is not uniform; a miss does not establish absence."
-        )
+                    retain(result)
 
     def full_scan(self, table: Table, coverage: Coverage) -> None:
         # One scan per table, rather than k separate full scans for k values.
         # The local deterministic function returns only rows containing evidence.
-        self.db.connection.create_function(
-            "_detective_hit",
-            1,
-            lambda v: int(self.store.codec.key(v) in self.store.targets),
-            deterministic=True,
-        )
-        where = " OR ".join("_detective_hit(" + qi(c.name) + ")" for c in table.columns)
-        sql = (
-            "SELECT "
-            + table.select_list()
-            + " FROM "
-            + qi(table.name)
-            + " WHERE "
-            + where
-        )
+        where = " OR ".join("_locator_hit(" + qi(c.name) + ")" for c in table.columns)
+        sql = table.select_sql() + " WHERE " + where
         result = self.db.run(
             sql,
             limit=self.cfg.max_hit_rows,
@@ -718,6 +860,13 @@ class ProbeEngine:
         if not result.complete:
             coverage.interrupted += 1
             coverage.notes.append("Scan incomplete: " + result.reason)
+
+
+def confirms_search(db: SQLiteReader, sql: str, params: list[Value]) -> bool:
+    plan = db.run("EXPLAIN QUERY PLAN " + sql, params)
+    return plan.complete and any(
+        str(row[-1]).startswith("SEARCH ") for row in plan.rows
+    )
 
 
 def assignments(
@@ -788,12 +937,18 @@ class Edge:
 
 class StructureMatcher:
     def __init__(
-        self, db: SQLiteReader, tables: dict[str, Table], store: EvidenceStore
+        self,
+        db: SQLiteReader,
+        tables: dict[str, Table],
+        store: EvidenceStore,
+        coverage: dict[str, Coverage],
     ):
-        self.db, self.tables, self.store = db, tables, store
+        self.db, self.tables, self.store, self.coverage = db, tables, store, coverage
         self.cfg, self.codec = db.config, store.codec
         self.findings: list[Finding] = []
         self._finding_signatures: set[tuple] = set()
+        self._declared_edges: list[Edge] | None = None
+        self._small_tables: dict[str, bool] = {}
         self.notes: set[str] = set()
 
     def view(self, front: FrontTable, transpose: bool) -> tuple[list[tuple], Callable]:
@@ -801,37 +956,57 @@ class StructureMatcher:
             return list(zip(*front.rows)), lambda r, c: (c, r)
         return front.rows, lambda r, c: (r, c)
 
-    def options(self, rows: list[tuple], names: list[str]) -> dict[int, list[Ref]]:
-        result = {}
+    def column_candidates(
+        self, rows: list[tuple]
+    ) -> dict[str, dict[int, list[tuple[float, Ref]]]]:
+        candidates = defaultdict(lambda: defaultdict(list))
         for j in range(len(rows[0])):
-            values = [r[j] for r in rows if r[j] is not None]
-            if not values:
-                continue  # NULL provides no evidence and is not used as a search key.
-            candidates = []
-            for name in names:
-                for i in range(len(self.tables[name].columns)):
-                    ref = (name, i)
-                    score = self.store.coverage(ref, values)
-                    if score >= self.cfg.min_containment:
-                        candidates.append((score, ref))
-            candidates.sort(key=lambda x: (-x[0], x[1]))
-            if len(candidates) > self.cfg.candidates_per_column:
-                self.notes.add(
-                    "Column candidates capped; increase --candidates-per-column."
+            keys = {self.codec.key(row[j]) for row in rows if row[j] is not None}
+            counts = Counter(
+                ref for key in keys for ref in self.store.references.get(key, ())
+            )
+            for ref, count in counts.items():
+                if count / len(keys) >= self.cfg.min_containment:
+                    candidates[ref[0]][j].append((count / len(keys), ref))
+        return candidates
+
+    def options(
+        self,
+        candidates: dict[str, dict[int, list[tuple[float, Ref]]]],
+        names: list[str],
+    ) -> dict[int, list[Ref]]:
+        combined = defaultdict(list)
+        for name in names:
+            for j, refs in candidates.get(name, {}).items():
+                if len(refs) > self.cfg.candidates_per_column:
+                    self.notes.add(
+                        "Column candidates capped; increase --candidates-per-column."
+                    )
+                combined[j].extend(
+                    sorted(refs, key=lambda x: (-x[0], x[1][1]))[
+                        : self.cfg.candidates_per_column
+                    ]
                 )
-            result[j] = [ref for _, ref in candidates[: self.cfg.candidates_per_column]]
-        return result
+        return {
+            j: [ref for _, ref in sorted(refs, key=lambda x: -x[0])]
+            for j, refs in sorted(combined.items())
+        }
 
     def run(self, fronts: list[FrontTable]) -> None:
         for front in fronts:
+            if self.db.deadline.expired():
+                break
             LOGGER.info("Verifying structures for: %s", front.name)
             for transpose in (False, True):
                 rows, coords = self.view(front, transpose)
-                for name in self.tables:
+                candidates = self.column_candidates(rows)
+                for name in sorted(candidates):
                     if self.db.deadline.expired():
                         break
-                    options = self.options(rows, [name])
-                    if not options or any(not c for c in options.values()):
+                    options = self.options(candidates, [name])
+                    if sum(row[j] is not None for row in rows for j in options) < min(
+                        4, front.cells
+                    ):
                         continue
                     count = 0
                     for mapping in assignments(
@@ -888,16 +1063,26 @@ class StructureMatcher:
         self, name: str, row: tuple, mapping: dict[int, Ref]
     ) -> list[tuple]:
         constraints = [
-            (j, i) for j, (n, i) in mapping.items() if n == name and row[j] is not None
+            (i, self.codec.key(row[j]))
+            for j, (n, i) in mapping.items()
+            if n == name and row[j] is not None
         ]
         if not constraints:
             return []
-        sets = [
-            self.store.hits.get((name, i), {}).get(self.codec.key(row[j]), set())
-            for j, i in constraints
-        ]
-        common = set.intersection(*(set(s) for s in sets))
-        return sorted(common, key=repr)[: self.cfg.witnesses]
+        buckets = (
+            self.store.hits.get((name, i), {}).get(key, ()) for i, key in constraints
+        )
+        anchors = min(buckets, key=len)
+        witnesses = self.store.rows.get(name, {})
+        matches = (
+            loc
+            for loc in sorted(anchors, key=repr)
+            if all(
+                self.codec.key(witnesses[loc].values[i]) == key
+                for i, key in constraints
+            )
+        )
+        return list(itertools.islice(matches, self.cfg.witnesses))
 
     def verify(
         self,
@@ -1082,8 +1267,6 @@ class StructureMatcher:
         by_cell = {(p.row, p.column): p for p in finding.proofs}
         selects = []
         for r, row in enumerate(front.rows):
-            if any(v is not None and (r, c) not in by_cell for c, v in enumerate(row)):
-                continue
             if not any((r, c) in by_cell for c in range(len(row))):
                 continue
             expressions = [f'{r + 1} AS "__gui_row"']
@@ -1104,154 +1287,290 @@ class StructureMatcher:
                         + ")"
                     )
                 else:
-                    expr = "NULL"  # A GUI NULL means missing evidence, not proof of a database NULL.
+                    expr = "NULL"  # An unverified cell has no source expression.
                 expressions.append(expr + " AS " + qi(label))
             selects.append("SELECT " + ",\n       ".join(expressions))
         return (
             "\nUNION ALL\n".join(selects) + "\nORDER BY 1;"
             if selects
-            else "-- No complete GUI rows in this fragment; see the cell locations."
+            else "-- No verified cells to replay."
         )
 
     def eav(self, front: FrontTable) -> None:
-        identity_codec = ValueCodec(
-            "strict"
-        )  # The text ID '42' is distinct from the numeric ID 42.
-        active = [
-            j
+        field_keys = {
+            j: {self.codec.key(row[j]) for row in front.rows if row[j] is not None}
             for j in range(len(front.columns))
-            if any(r[j] is not None for r in front.rows)
-        ]
-        if len(active) < 2:
+        }
+        field_keys = {j: keys for j, keys in field_keys.items() if keys}
+        if len(field_keys) < 2:
             return
-        all_values = [v for row in front.rows for v in row if v is not None]
-        for name, table in self.tables.items():
-            witnesses = list(self.store.rows.get(name, {}).values())
-            if not witnesses or self.db.deadline.expired():
-                continue
-            value_cols = [
-                i
-                for i in range(len(table.columns))
-                if self.store.coverage((name, i), all_values)
-                >= self.cfg.min_containment
-            ]
-            for vi in value_cols:
+        front_keys = set().union(*field_keys.values())
+        identity = ValueCodec("strict")
+        for name in sorted(self.store.rows):
+            if self.db.deadline.expired():
+                return
+            table = self.tables[name]
+            for vi in range(len(table.columns)):
+                if self.db.deadline.expired():
+                    return
+                hits = self.store.hits.get((name, vi), {})
+                if (
+                    sum(
+                        len(keys & hits.keys()) / len(keys) >= self.cfg.min_containment
+                        for keys in field_keys.values()
+                    )
+                    < 2
+                ):
+                    continue
                 relevant = [
                     w
-                    for w in witnesses
-                    if self.codec.key(w.values[vi]) in self.store.targets
+                    for w in self.store.rows[name].values()
+                    if self.codec.key(w.values[vi]) in front_keys
                 ]
-                # EAV repeats entity/attribute IDs; GUI attribute names are not required.
                 candidates = []
-                for i in range(len(table.columns)):
-                    if i == vi:
+                single_pk = sum(column.pk_order > 0 for column in table.columns) == 1
+                for i, column in enumerate(table.columns):
+                    if i == vi or (column.pk_order and single_pk):
                         continue
-                    counts = Counter(
-                        self.codec.key(w.values[i])
+                    ids = {
+                        identity.key(w.values[i])
                         for w in relevant
                         if w.values[i] is not None
+                    }
+                    if not ids:
+                        continue
+                    candidates.append(
+                        (column.index is None, len(ids) == len(relevant), i)
                     )
-                    if any(v > 1 for v in counts.values()):
-                        candidates.append(i)
                 if len(candidates) > self.cfg.max_eav_columns:
-                    self.notes.add("EAV key columns capped by --max-eav-columns.")
-                    candidates = candidates[: self.cfg.max_eav_columns]
-                for entity, attribute in itertools.permutations(candidates, 2):
+                    self.notes.add("EAV entity columns capped by --max-eav-columns.")
+                for _, _, entity in sorted(candidates)[: self.cfg.max_eav_columns]:
                     if self.db.deadline.expired():
                         return
-                    groups: dict[Key, dict[Key, list[Witness]]] = defaultdict(
-                        lambda: defaultdict(list)
+                    self.fetch_entity_witnesses(
+                        table, vi, entity, front, front_keys, relevant, identity
                     )
-                    value_attrs: dict[Key, set[Key]] = defaultdict(set)
-                    for w in relevant:
-                        ek = identity_codec.key(w.values[entity])
-                        ak = identity_codec.key(w.values[attribute])
-                        vk = self.codec.key(w.values[vi])
-                        if ek is not None and ak is not None:
-                            groups[ek][ak].append(w)
-                            value_attrs[vk].add(ak)
-                    options = {}
-                    for j in active:
-                        sets = [
-                            value_attrs[self.codec.key(r[j])]
-                            for r in front.rows
-                            if r[j] is not None
-                        ]
-                        common = set.intersection(*(set(s) for s in sets))
-                        options[j] = sorted(common, key=repr)[
-                            : self.cfg.candidates_per_column
-                        ]
-                    if any(not options[j] for j in active):
+                    self.match_entities(
+                        front, table, vi, entity, field_keys, front_keys, identity
+                    )
+
+    def fetch_entity_witnesses(
+        self,
+        table: Table,
+        vi: int,
+        entity: int,
+        front: FrontTable,
+        front_keys: set[Key],
+        relevant: list[Witness],
+        identity: ValueCodec,
+    ) -> None:
+        if self.store.capacity_limit:
+            return
+        coverage = self.coverage[table.name]
+        column = table.columns[entity]
+        if column.index is None and not self.small_enough_for_entity_scan(
+            table, coverage
+        ):
+            return
+        hits = self.store.hits[(table.name, vi)]
+        ordered = sorted(
+            relevant, key=lambda w: len(hits[self.codec.key(w.values[vi])])
+        )
+        ids = {}
+        limit = min(
+            max(self.cfg.witnesses, len(front.rows)),
+            self.db.connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) - 1,
+        )
+        for w in ordered:
+            value = w.values[entity]
+            if value is not None:
+                ids.setdefault(identity.key(value), value)
+            if len(ids) >= limit:
+                break
+        if not ids:
+            return
+        if len(ids) == limit:
+            self.notes.add("EAV entity lookups reached the anchor limit.")
+        row_limit = min(
+            self.cfg.max_hit_rows,
+            max(front.cells * 2, len(ids) * len(front.columns) * 2),
+        )
+        sql = (
+            table.select_sql(column.index)
+            + " WHERE "
+            + column.index_expression
+            + " IN ("
+            + ",".join("?" for _ in ids)
+            + ") AND _locator_hit("
+            + qi(table.columns[vi].name)
+            + ") LIMIT ?"
+        )
+        params = [*ids.values(), row_limit + 1]
+        if column.index is not None and not confirms_search(self.db, sql, params):
+            self.notes.add(
+                f"{table.name}.{column.name}: EAV indexed search could not be confirmed."
+            )
+            return
+        offset = len(table.locator)
+
+        def retain(raw: tuple) -> bool:
+            if (
+                identity.key(raw[offset + entity]) in ids
+                and self.codec.key(raw[offset + vi]) in front_keys
+            ):
+                return self.store.add(table, raw, entity_match=True)
+            return True
+
+        result = self.db.run(sql, params, limit=row_limit, consume=retain)
+        coverage.entity_probes += 1
+        if not result.complete and result.reason != "evidence capacity reached":
+            self.notes.add(
+                "Some EAV entity lookups were interrupted or truncated; review the limits."
+            )
+
+    def small_enough_for_entity_scan(self, table: Table, coverage: Coverage) -> bool:
+        if coverage.all_rows_sampled:
+            return True
+        if not (
+            coverage.full_scan_finished
+            and self.store.occurrences_limited
+            and self.cfg.sample_rows
+        ):
+            return False
+        if table.name not in self._small_tables:
+            limit = self.cfg.sample_rows + 1
+            result = self.db.run(
+                f"SELECT 1 FROM {qi(table.name)} LIMIT ?", [limit], limit=limit
+            )
+            self._small_tables[table.name] = result.complete and result.count < limit
+        return self._small_tables[table.name]
+
+    def match_entities(
+        self,
+        front: FrontTable,
+        table: Table,
+        vi: int,
+        entity: int,
+        field_keys: dict[int, set[Key]],
+        front_keys: set[Key],
+        identity: ValueCodec,
+    ) -> None:
+        relevant = [
+            (w, identity.key(w.values[entity]), self.codec.key(w.values[vi]))
+            for w in self.store.rows[table.name].values()
+            if w.values[entity] is not None
+            and self.codec.key(w.values[vi]) in front_keys
+        ]
+        active_rows = sum(any(v is not None for v in row) for row in front.rows)
+        candidates = []
+        for attribute in range(len(table.columns)):
+            if attribute in (entity, vi):
+                continue
+            counts = Counter(
+                identity.key(w.values[attribute])
+                for w, _, _ in relevant
+                if w.values[attribute] is not None
+            )
+            repeated = sum(count > 1 for count in counts.values())
+            if counts and (repeated or active_rows == 1):
+                candidates.append((-repeated, attribute))
+        if len(candidates) > self.cfg.max_eav_columns:
+            self.notes.add("EAV attribute columns capped by --max-eav-columns.")
+        for _, attribute in sorted(candidates)[: self.cfg.max_eav_columns]:
+            if self.db.deadline.expired():
+                return
+            groups: dict[Key, dict[tuple[Key, Key], Witness]] = defaultdict(dict)
+            entities_by_cell: dict[tuple[Key, Key], set[Key]] = defaultdict(set)
+            value_attrs: dict[Key, set[Key]] = defaultdict(set)
+            attributes = {}
+            for w, ek, vk in relevant:
+                ak = identity.key(w.values[attribute])
+                if ak is not None:
+                    groups[ek].setdefault((ak, vk), w)
+                    entities_by_cell[(ak, vk)].add(ek)
+                    value_attrs[vk].add(ak)
+                    attributes.setdefault(ak, w.values[attribute])
+            options = {}
+            for j, keys in field_keys.items():
+                counts = Counter(ak for key in keys for ak in value_attrs.get(key, ()))
+                viable = [
+                    ak
+                    for ak in sorted(counts, key=lambda ak: (-counts[ak], repr(ak)))
+                    if counts[ak] / len(keys) >= self.cfg.min_containment
+                ]
+                if len(viable) > self.cfg.candidates_per_column:
+                    self.notes.add(
+                        "EAV attribute candidates capped by --candidates-per-column."
+                    )
+                if viable:
+                    options[j] = viable[: self.cfg.candidates_per_column]
+            if len(options) < 2:
+                continue
+            for mapping in assignments(
+                options, self.cfg.max_mappings, self.db.deadline
+            ):
+                choices: dict[int, list[Key]] = {}
+                checks = {}
+                for r, row in enumerate(front.rows):
+                    if self.db.deadline.expired():
+                        return
+                    cells = {
+                        j: (ak, self.codec.key(row[j]))
+                        for j, ak in mapping.items()
+                        if row[j] is not None
+                    }
+                    if not cells:
                         continue
-                    for mapping in assignments(
-                        options, self.cfg.max_mappings, self.db.deadline
-                    ):
-                        choices, proofs_by_entity = {}, {}
-                        for r, row in enumerate(front.rows):
-                            for ek, attrs in groups.items():
-                                proofs = []
-                                for j, ak in mapping.items():
-                                    if row[j] is None:
-                                        continue
-                                    w = next(
-                                        (
-                                            w
-                                            for w in attrs.get(ak, [])
-                                            if self.codec.key(w.values[vi])
-                                            == self.codec.key(row[j])
-                                        ),
-                                        None,
-                                    )
-                                    if w is None:
-                                        break
-                                    proofs.append(
-                                        CellProof(
-                                            r,
-                                            j,
-                                            name,
-                                            table.columns[vi].name,
-                                            dict(zip(table.locator, w.locator)),
-                                            w.values[vi],
-                                        )
-                                    )
-                                else:
-                                    if proofs:
-                                        choices.setdefault(r, []).append(ek)
-                                        proofs_by_entity[(r, ek)] = proofs
-                        matched = distinct_witnesses(choices)
-                        if len(matched) < min(2, len(front.rows)):
-                            continue
-                        proofs = [
-                            p
-                            for r, ek in sorted(matched.items())
-                            for p in proofs_by_entity[(r, ek)]
-                        ]
-                        descriptions = [
-                            f"entity: {table.columns[entity].name}; attribute: "
-                            f"{table.columns[attribute].name}; value: {table.columns[vi].name}"
-                        ]
-                        for j, ak in sorted(mapping.items()):
-                            raw_attr = next(
-                                w.values[attribute]
-                                for w in relevant
-                                if identity_codec.key(w.values[attribute]) == ak
+                    anchors = min(
+                        (entities_by_cell.get(c, ()) for c in cells.values()), key=len
+                    )
+                    matching = (
+                        ek
+                        for ek in sorted(anchors, key=repr)
+                        if all(cell in groups[ek] for cell in cells.values())
+                    )
+                    choices[r] = list(itertools.islice(matching, self.cfg.witnesses))
+                    checks[r] = cells
+                matched = distinct_witnesses(choices)
+                if len(matched) < min(2, active_rows):
+                    continue
+                proofs = []
+                for r, ek in sorted(matched.items()):
+                    for j, key in checks[r].items():
+                        w = groups[ek][key]
+                        proofs.append(
+                            CellProof(
+                                r,
+                                j,
+                                table.name,
+                                table.columns[vi].name,
+                                dict(zip(table.locator, w.locator)),
+                                w.values[vi],
                             )
-                            descriptions.append(
-                                f"{front.columns[j]} → attribute {shown(raw_attr)}"
-                            )
-                        self.add_finding(
-                            Finding(
-                                front.name,
-                                "EAV",
-                                [name],
-                                front.cells,
-                                proofs,
-                                descriptions,
-                                "Values for each GUI row share an entity identifier; "
-                                "the attribute mapping is shared across all matched rows.",
-                            ),
-                            front,
                         )
+                if len(proofs) < min(4, front.cells):
+                    continue
+                descriptions = [
+                    f"entity: {table.columns[entity].name}; attribute: "
+                    f"{table.columns[attribute].name}; value: {table.columns[vi].name}"
+                ]
+                descriptions.extend(
+                    f"{front.columns[j]} → attribute {shown(attributes[ak])}"
+                    for j, ak in sorted(mapping.items())
+                )
+                self.add_finding(
+                    Finding(
+                        front.name,
+                        "EAV",
+                        [table.name],
+                        front.cells,
+                        proofs,
+                        descriptions,
+                        "Values for each GUI row share an entity identifier; "
+                        "the attribute mapping is shared across all matched rows.",
+                    ),
+                    front,
+                )
 
     def declared_edges(self) -> list[Edge]:
         edges = []
@@ -1274,11 +1593,11 @@ class StructureMatcher:
         return edges
 
     def inferred_edges(self, names: set[str], existing: list[Edge]) -> list[Edge]:
-        """A small candidate graph only; matching IDs do not prove relationship semantics."""
+        """Propose edges from shared witness IDs, independent of catalog order."""
         fields = []
-        if len(names) > 24:
-            self.notes.add("Inferred joins limited to 24 tables containing hits.")
-        for name in sorted(names)[:24]:
+        for name in sorted(names):
+            if self.db.deadline.expired():
+                return []
             witnesses = list(self.store.rows[name].values())
             for c, col in enumerate(self.tables[name].columns):
                 values = [
@@ -1292,9 +1611,13 @@ class StructureMatcher:
         postings: dict[Key, list[int]] = defaultdict(list)
         for i, (_, _, keys) in enumerate(fields):
             for key in keys:
-                postings[key].append(i)
+                bucket = postings[key]
+                if len(bucket) <= 32:
+                    bucket.append(i)
         counts: Counter = Counter()
         for locations in postings.values():
+            if self.db.deadline.expired():
+                return []
             if (
                 len(locations) > 32
             ):  # Skip overly common values to avoid a combinatorial number of pairs.
@@ -1303,6 +1626,7 @@ class StructureMatcher:
                 if fields[a][0] != fields[b][0]:
                     counts[(a, b)] += 1
         result = []
+        declared = set(existing)
         for (a, b), overlap in counts.most_common():
             if self.db.deadline.expired():
                 break
@@ -1313,9 +1637,8 @@ class StructureMatcher:
             pair = (
                 (self.tables[ln].columns[lc].name, self.tables[rn].columns[rc].name),
             )
-            if any(
-                e.left == ln and e.right == rn and e.pairs == pair for e in existing
-            ):
+            reverse = tuple((r, l) for l, r in pair)
+            if Edge(ln, rn, pair) in declared or Edge(rn, ln, reverse) in declared:
                 continue
             result.append(Edge(ln, rn, pair, True))
             if len(result) == 32:
@@ -1328,62 +1651,95 @@ class StructureMatcher:
     def joins(self, front: FrontTable) -> None:
         if self.cfg.max_join_hops == 0:
             return
-        all_options = self.options(front.rows, list(self.tables))
-        names = {ref[0] for refs in all_options.values() for ref in refs}
-        if len(names) < 2:
+        candidates = self.column_candidates(front.rows)
+        if len(candidates) < 2:
             return
-        edges = self.declared_edges()
-        edges += self.inferred_edges(names, edges)
+        if self._declared_edges is None:
+            self._declared_edges = self.declared_edges()
+        frequency = Counter(j for fields in candidates.values() for j in fields)
+        support = {
+            name: sum(
+                max(score for score, _ in refs) / frequency[j]
+                for j, refs in fields.items()
+            )
+            for name, fields in candidates.items()
+        }
+        rank = lambda name: (-support.get(name, 0), name)
         graph: dict[str, list[Edge]] = defaultdict(list)
-        for edge in edges:
-            graph[edge.left].append(edge)
-            graph[edge.right].append(edge)
-        seen, paths, expanded = set(), 0, 0
-        for start in sorted(names):
-            queue = deque([([start], [])])
-            while queue and not self.db.deadline.expired():
-                nodes, path = queue.popleft()
-                expanded += 1
-                if (
-                    paths >= self.cfg.max_join_paths
-                    or expanded > self.cfg.max_join_paths * 20
-                ):
-                    self.notes.add(
-                        "JOIN path search capped; increase --max-join-paths."
-                    )
-                    return
-                if len(nodes) > 1 and nodes[-1] in names:
-                    signature = tuple(sorted(repr(e) for e in path))
-                    if signature not in seen:
-                        seen.add(signature)
-                        paths += 1
-                        options = self.options(front.rows, nodes)
-                        if options and all(options.values()):
-                            count = 0
-                            for mapping in assignments(
-                                options, self.cfg.max_mappings, self.db.deadline
-                            ):
-                                if len({ref[0] for ref in mapping.values()}) < 2:
-                                    continue
-                                count += 1
-                                self.verify(
-                                    front,
-                                    front.rows,
-                                    lambda r, c: (r, c),
-                                    nodes,
-                                    path,
-                                    mapping,
-                                    "JOIN",
-                                )
-                            if count >= self.cfg.max_mappings:
-                                self.notes.add(
-                                    "Mapping limit reached during JOIN verification."
-                                )
-                if len(path) < self.cfg.max_join_hops:
-                    for edge in graph[nodes[-1]]:
-                        other = edge.other(nodes[-1])
-                        if other not in nodes:
-                            queue.append((nodes + [other], path + [edge]))
+        seen: set[frozenset[Edge]] = set()
+        paths = 0
+        expanded = 0
+        expansion_limit = 20 * self.cfg.max_join_paths
+        # Declared paths are tested first. Tables without an edge consume no
+        # path budget, even if their columns match common frontend values.
+        for inferred in (False, True):
+            edges = (
+                self.inferred_edges(set(candidates), self._declared_edges)
+                if inferred
+                else self._declared_edges
+            )
+            if not edges:
+                continue
+            for edge in edges:
+                graph[edge.left].append(edge)
+                graph[edge.right].append(edge)
+            for start in sorted(candidates.keys() & graph.keys(), key=rank):
+                queue = deque([([start], [])])
+                while queue and not self.db.deadline.expired():
+                    nodes, path = queue.popleft()
+                    if paths >= self.cfg.max_join_paths or expanded >= expansion_limit:
+                        self.notes.add(
+                            "JOIN path search capped; increase --max-join-paths."
+                        )
+                        return
+                    end = nodes[-1]
+                    if path:
+                        expanded += 1
+                    if path and end in candidates:
+                        signature = frozenset(path)
+                        if signature not in seen:
+                            seen.add(signature)
+                            if self.verify_path(front, candidates, nodes, path):
+                                paths += 1
+                    if len(path) >= self.cfg.max_join_hops:
+                        continue
+                    adjacent = sorted(graph[end], key=lambda e: rank(e.other(end)))
+                    for edge in adjacent:
+                        other = edge.other(end)
+                        if other in nodes:
+                            continue
+                        if len(queue) + expanded >= expansion_limit:
+                            self.notes.add(
+                                "JOIN path search capped; increase --max-join-paths."
+                            )
+                            break
+                        queue.append((nodes + [other], path + [edge]))
+
+    def verify_path(
+        self,
+        front: FrontTable,
+        candidates: dict[str, dict[int, list[tuple[float, Ref]]]],
+        nodes: list[str],
+        path: list[Edge],
+    ) -> bool:
+        options = self.options(candidates, nodes)
+        if len(options) < 2:
+            return False
+        if sum(row[j] is not None for row in front.rows for j in options) < min(
+            4, front.cells
+        ):
+            return False
+        endpoints = {nodes[0], nodes[-1]}
+        mapped = 0
+        for mapping in assignments(options, self.cfg.max_mappings, self.db.deadline):
+            mapped += 1
+            if endpoints <= {ref[0] for ref in mapping.values()}:
+                self.verify(
+                    front, front.rows, lambda r, c: (r, c), nodes, path, mapping, "JOIN"
+                )
+        if mapped >= self.cfg.max_mappings:
+            self.notes.add("Mapping limit reached during JOIN verification.")
+        return mapped > 0
 
 
 class ReportWriter:
@@ -1395,6 +1751,7 @@ class ReportWriter:
         "EAV": "Entity · attribute · value",
         "JOIN": "Joined tables",
     }
+    HTML_COVERAGE_ROWS = 1000
 
     def __init__(
         self,
@@ -1417,11 +1774,13 @@ class ReportWriter:
         locations, count = [], 0
         if key is None:
             return locations, count
-        for (name, c), keys in self.store.hits.items():
-            locs = keys.get(key, ())
+        for name, c in sorted(self.store.references.get(key, ())):
+            locs = self.store.hits[(name, c)][key]
             count += len(locs)
-            for loc in sorted(locs, key=repr):
-                if len(locations) < limit:
+            if len(locations) < limit:
+                for loc in itertools.islice(
+                    sorted(locs, key=repr), limit - len(locations)
+                ):
                     locations.append(
                         {
                             "table": name,
@@ -1435,7 +1794,6 @@ class ReportWriter:
     def column_matches(self) -> list[dict]:
         result = []
         # IDF weights cover observed columns only, not the entire database.
-        df = Counter(k for keys in self.store.hits.values() for k in keys)
         column_count = max(1, len(self.store.hits))
         for front in self.fronts:
             for j, label in enumerate(front.columns):
@@ -1445,10 +1803,16 @@ class ReportWriter:
                 if not keys:
                     continue
                 weight = {
-                    k: 1 + math.log((column_count + 1) / (df[k] + 1)) for k in keys
+                    k: 1
+                    + math.log(
+                        (column_count + 1) / (len(self.store.references.get(k, ())) + 1)
+                    )
+                    for k in keys
                 }
                 candidates = []
-                for ref, hits in self.store.hits.items():
+                refs = {ref for k in keys for ref in self.store.references.get(k, ())}
+                for ref in refs:
+                    hits = self.store.hits[ref]
                     overlap = keys & hits.keys()
                     if overlap:
                         candidates.append(
@@ -1524,7 +1888,7 @@ class ReportWriter:
             f'Source: {m["source"]}',
             f'Frontend: {m["frontend"]}',
             f'Mode: {m["config"]["mode"]}; comparison: {m["config"]["comparison"]}',
-            f'Tables: {len(self.tables)}; source queries: {m["source_queries"]}; '
+            f'Tables inspected: {m["tables_started"]}/{len(self.tables)}; source queries: {m["source_queries"]}; '
             f'search time: {m["elapsed_seconds"]:.2f} s',
             "",
             "Sample agreement does not prove the historical origin of the GUI data.",
@@ -1557,7 +1921,7 @@ class ReportWriter:
                 ]
             out += [
                 "",
-                "SQL replaying the verified complete sample rows:",
+                "SQL replay of verified cells (NULL for unverified cells):",
                 f.replay_sql,
             ]
         out += ["", "=" * 70, "INDIVIDUAL VALUES — do not establish a shared row"]
@@ -1575,7 +1939,8 @@ class ReportWriter:
         out += ["", "SEARCH COVERAGE"]
         for c in self.coverage:
             out.append(
-                f"{c.table}: sample={c.sample_rows}, index probes={c.index_probes}, "
+                f"{c.table}: started={c.started}, empty={c.empty}, "
+                f"sample={c.sample_rows}, index probes={c.index_probes}, entity lookups={c.entity_probes}, "
                 f"retained rows={c.retained_rows}, full scan={c.full_scan_finished}, "
                 f"interruptions={c.interrupted}, truncated probes={c.truncated_probes}"
             )
@@ -1644,7 +2009,7 @@ button{{padding:7px 12px;border:1px solid #b9cdbf;border-radius:5px;background:w
 .empty{{padding:24px;border:1px dashed #b6c7ba;border-radius:8px;color:var(--muted)}}footer{{border-top:1px solid var(--line);padding-top:20px;color:var(--muted);font-size:11px}}[hidden]{{display:none!important}}
 @media(max-width:760px){{.metrics{{grid-template-columns:repeat(2,1fr)}}.filterbar{{grid-template-columns:1fr}}.mapping{{grid-template-columns:1fr}}main{{padding:20px 14px}}.card{{padding:16px}}nav{{gap:16px;font-size:12px;padding:10px}}header{{padding:18px 16px;align-items:start}}.run-date{{font-size:10px;max-width:110px}}}}
 @media print{{nav,.filterbar,button,input{{display:none}}body{{background:white}}header{{background:white;color:black;padding:10px}}header small,.run-date{{color:#555}}.scroll,pre{{max-height:none;overflow:visible}}.card{{break-inside:avoid}}}}
-</style></head><body><header><div><div class="brand">SQLite Locator</div><small>Data analysis report</small></div><div class="run-date">{esc(m['created_at'])}<br>v{esc(m.get('version', VERSION))}</div></header>
+</style></head><body><header><div><div class="brand">SQLite Locator</div><small>Data analysis report</small></div><div class="run-date">{esc(m['created_at'])}</div></header>
 <nav aria-label="Report navigation"><a href="#results">Matches</a><a href="#sample">Sample</a><a href="#locations">Value locations</a><a href="#coverage">Analysis coverage</a></nav><main>
 <div class="overview-head"><div><h1>Search results</h1><span class="muted">{esc(Path(m['source']).name)}</span></div><span class="status {'warn' if notices else 'ok'}">{status}</span></div>
 <div class="metrics"><div class="metric"><b>{complete}</b><span>complete sample matches</span></div><div class="metric"><b>{located}/{total}</b><span>cells with a located value</span></div><div class="metric"><b>{retained} / {len(self.tables)}</b><span>tables with hits / analyzed</span></div><div class="metric"><b>{m['elapsed_seconds']:.2f} s</b><span>search time</span></div></div>
@@ -1752,7 +2117,8 @@ button{{padding:7px 12px;border:1px solid #b9cdbf;border-radius:5px;background:w
                 + "</details>"
             )
             parts.append(
-                '<details><summary>Sample SQL</summary><div class="sqlbar"><span class="note">Verified rows in GUI order.</span>'
+                '<details><summary>Sample SQL</summary><div class="sqlbar"><span class="note">'
+                "Verified cells in GUI order. Unverified cells are returned as NULL.</span>"
                 + f'<button type="button" data-copy="sql-{index}">Copy SQL</button></div><pre id="sql-{index}">'
                 + html.escape(f.replay_sql)
                 + "</pre></details>"
@@ -1840,7 +2206,9 @@ button{{padding:7px 12px;border:1px solid #b9cdbf;border-radius:5px;background:w
         for note in notices:
             parts.append('<div class="notice">' + esc(note) + "</div>")
         parts.append(
-            '<div class="card"><div class="source"><span>Tables: <strong>'
+            '<div class="card"><div class="source"><span>Tables inspected: <strong>'
+            + str(m["tables_started"])
+            + "/"
             + str(len(self.coverage))
             + "</strong></span><span>Queries: <strong>"
             + str(m["source_queries"])
@@ -1849,20 +2217,27 @@ button{{padding:7px 12px;border:1px solid #b9cdbf;border-radius:5px;background:w
             + '</strong></span></div><details><summary>Coverage by table</summary><label>Filter tables<input id="coverage-search" type="search" placeholder="Table name"></label>'
         )
         coverage_rows = []
-        for c in sorted(self.coverage, key=lambda x: (-x.retained_rows, x.table)):
-            state = (
-                "Full scan complete"
-                if c.full_scan_finished
-                else (
-                    "Interrupted"
-                    if c.interrupted
-                    else (
-                        "Indexes / sample"
-                        if c.sample_rows or c.index_probes
-                        else "Not checked"
-                    )
-                )
+        visible_tables = heapq.nsmallest(
+            self.HTML_COVERAGE_ROWS,
+            self.coverage,
+            key=lambda c: (-c.retained_rows, not c.interrupted, c.table),
+        )
+        if len(visible_tables) < len(self.coverage):
+            parts.append(
+                f'<p class="note">Showing {len(visible_tables):,} of {len(self.coverage):,} tables. '
+                "See the TXT or JSON report for the full list.</p>"
             )
+        for c in visible_tables:
+            if c.empty:
+                state = "Empty"
+            elif c.full_scan_finished or c.all_rows_sampled:
+                state = "All rows examined"
+            elif c.interrupted:
+                state = "Interrupted"
+            elif c.started:
+                state = "Checked"
+            else:
+                state = "Not checked"
             coverage_rows.append(
                 [
                     "<code>" + esc(c.table) + "</code>",
@@ -1870,6 +2245,7 @@ button{{padding:7px 12px;border:1px solid #b9cdbf;border-radius:5px;background:w
                     str(c.retained_rows),
                     str(c.sample_rows),
                     str(c.index_probes),
+                    str(c.entity_probes),
                     state,
                 ]
             )
@@ -1880,7 +2256,8 @@ button{{padding:7px 12px;border:1px solid #b9cdbf;border-radius:5px;background:w
                     "Columns",
                     "Rows with hits",
                     "Sample rows",
-                    "Probes",
+                    "Index probes",
+                    "Entity lookups",
                     "Coverage",
                 ],
                 coverage_rows,
@@ -1940,9 +2317,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--version", action="version", version="SQLite Locator " + VERSION
-    )
-    parser.add_argument(
         "--quiet", action="store_true", help="Suppress progress messages on stderr."
     )
     parser.add_argument(
@@ -1989,17 +2363,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     help_text = {
         "sample_rows": "Combined size of samples from the beginning and end of each table.",
         "random_seeks": "Additional rowid seeks; up to 4 rows per seek, without random sorting.",
-        "witnesses": "Maximum retained locations per value/column and rows per index probe.",
+        "witnesses": "Occurrence threshold for admitting new evidence and row limit per index probe.",
         "max_evidence_rows": "Global limit on retained rows containing evidence.",
         "max_evidence_bytes": "Approximate evidence payload limit, excluding indexes and interpreter overhead.",
         "max_row_bytes": "SQLite limit on the size of a single row/value, in bytes.",
         "max_hit_rows": "Maximum matching rows returned by a scan of one table.",
-        "max_tables": "Maximum number of catalog tables to read.",
+        "max_tables": "Maximum source tables after filtering; 0 has no table count limit.",
         "max_columns": "Wider tables are skipped and reported.",
         "max_frontend_rows": "Maximum rows per GUI sample; exceeding the limit is an error.",
         "max_frontend_cells": "Maximum total number of frontend cells.",
         "max_value_bytes": "Retained value size limit: text characters or BLOB bytes.",
-        "candidates_per_column": "Maximum candidate columns per layout position.",
+        "candidates_per_column": "Maximum candidate columns per table and layout position.",
         "max_mappings": "Maximum alternative mappings for each table layout.",
         "max_join_hops": "Maximum JOIN path length in edges; 0 disables joins.",
         "max_join_paths": "Maximum JOIN paths evaluated per GUI sample.",
@@ -2024,7 +2398,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         value = getattr(args, name)
         if name == "seed":
             continue
-        zero_allowed = name in ("random_seeks", "sample_rows", "max_join_hops")
+        zero_allowed = name in (
+            "random_seeks",
+            "sample_rows",
+            "max_join_hops",
+            "max_tables",
+        )
         if (
             value < 0
             or (not zero_allowed and value == 0)
@@ -2061,28 +2440,40 @@ def main(argv: list[str] | None = None) -> int:
         **{name: getattr(args, name) for name in Config.__dataclass_fields__}
     )
     deadline = Deadline(config.total_seconds)
+    discovery_deadline = Deadline(
+        config.total_seconds - min(10, config.total_seconds * 0.1)
+    )
     connections = []
     try:
         frontend_db = SQLiteReader(args.frontend, config, deadline)
         connections.append(frontend_db)
         fronts = load_frontend(frontend_db, args.frontend_table)
-        source = SQLiteReader(args.source, config, deadline)
+        source = SQLiteReader(args.source, config, discovery_deadline)
         connections.append(source)
         catalog = Catalog(source)
-        tables = catalog.read(args.table_pattern)
+        tables = catalog.read(args.table_pattern, limit=config.max_tables)
         codec = ValueCodec(config.comparison)
         store = EvidenceStore(codec, fronts, config)
+        source.connection.create_function(
+            "_locator_hit", 1, store.matches, deterministic=True
+        )
         probe = ProbeEngine(source, store)
         probe.run(tables)
-        matcher = StructureMatcher(source, tables, store)
+        source.deadline = deadline
+        matcher = StructureMatcher(source, tables, store, probe.coverage)
         matcher.run(fronts)
         notes = list(catalog.notes) + sorted(matcher.notes)
         if deadline.expired():
             notes.append("Global time limit reached. Results are partial.")
-        if store.capped:
+        if probe.stop_reason and not store.capacity_limit:
+            notes.append(probe.stop_reason)
+        if store.capacity_limit:
             notes.append(
-                "Evidence retention was capped by witnesses / max-evidence-rows / max-evidence-bytes. "
-                "Additional occurrences and some structures may have been omitted."
+                f"Evidence discovery stopped at {store.capacity_limit}. Search coverage is partial."
+            )
+        if store.occurrences_limited:
+            notes.append(
+                "The occurrence limit (--witnesses) restricted some value locations and layouts."
             )
         if store.oversized:
             notes.append(
@@ -2108,13 +2499,19 @@ def main(argv: list[str] | None = None) -> int:
                 "Rowid sampling is biased by key distribution and does not provide probability estimates.",
             ]
         )
+        coverage = [
+            probe.coverage.get(table.name) or Coverage(table.name, len(table.columns))
+            for table in tables.values()
+        ]
+        for c in coverage:
+            c.retained_rows = len(store.rows.get(c.table, {}))
         metadata = {
-            "version": VERSION,
             "source": str(args.source.resolve()),
             "frontend": str(args.frontend.resolve()),
             "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "elapsed_seconds": round(time.monotonic() - deadline.started, 4),
             "source_queries": source.queries,
+            "tables_started": len(probe.coverage),
             "returned_rows": source.returned_rows,
             "interrupted_queries": source.interruptions,
             "query_errors": source.errors,
@@ -2123,7 +2520,7 @@ def main(argv: list[str] | None = None) -> int:
             "operational_notes": operational_notes,
             "evidence_payload_bytes": store.payload_bytes,
         }
-        writer = ReportWriter(fronts, tables, store, matcher, probe.coverage, metadata)
+        writer = ReportWriter(fronts, tables, store, matcher, coverage, metadata)
         paths = writer.write(args.report)
         print(
             f"Found {len(matcher.findings)} layouts, including "

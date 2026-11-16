@@ -80,8 +80,15 @@ class Integration(unittest.TestCase):
                     self.assertEqual(len(rows), len(front["rows"]))
                 for row in rows:
                     expected = front["rows"][row[0] - 1]
-                    for a, b in zip(row[1:], expected):
-                        if b is not None and not isinstance(b, dict):
+                    verified = {
+                        proof["column"]
+                        for proof in finding["proofs"]
+                        if proof["row"] == row[0] - 1
+                    }
+                    for j, (a, b) in enumerate(zip(row[1:], expected)):
+                        if j not in verified:
+                            self.assertIsNone(a)
+                        elif not isinstance(b, dict):
                             self.assertEqual(codec.key(a), codec.key(b))
 
     def test_demo_random_seeds(self):
@@ -308,6 +315,201 @@ class Integration(unittest.TestCase):
         )
         p = self.run_finder()
         self.assertFalse(any(f["full"] for f in p["findings"]))
+
+    def test_common_value_does_not_hide_retained_rows(self):
+        rows = [
+            ("Gala GA-418", "red", 6.75),
+            ("Idared ID-762", "red", 5.89),
+            ("Granny Smith", "green", 7.25),
+        ]
+        self.prepare(
+            rows,
+            "CREATE TABLE t(v, c, p); CREATE INDEX by_name ON t(v); "
+            "CREATE INDEX by_color ON t(c);",
+            [
+                (
+                    "INSERT INTO t VALUES(?,?,?)",
+                    [(f"Other-{i}", "red", i + 100) for i in range(100)] + rows,
+                )
+            ],
+        )
+        for mode in ("bounded", "exhaustive"):
+            with self.subTest(mode=mode):
+                p = self.run_finder("--mode", mode, "--witnesses", "2")
+                finding = next(
+                    f for f in p["findings"] if f["kind"] == "rows" and f["full"]
+                )
+                self.assertEqual(
+                    {proof["locator"]["_rowid_"] for proof in finding["proofs"]},
+                    {101, 102, 103},
+                )
+                self.assert_replays(p)
+
+    def test_eav_recovers_common_values_via_indexed_entities(self):
+        rows = [
+            ("Gala GA-418", "red"),
+            ("Idared ID-762", "red"),
+            ("Granny Smith", "green"),
+        ]
+        data = [(f"other-{i}", "color-code", "red") for i in range(55)]
+        for i, (name, color) in enumerate(rows):
+            data.extend(
+                [
+                    (f"entity-{i}", "name-code", name),
+                    (f"entity-{i}", "color-code", color),
+                ]
+            )
+        self.prepare(
+            rows,
+            "CREATE TABLE t(e, a, v); CREATE INDEX by_value ON t(v); "
+            "CREATE INDEX by_entity ON t(e, a);",
+            [("INSERT INTO t VALUES(?,?,?)", data)],
+        )
+        p = self.run_finder("--sample-rows", "0", "--witnesses", "2")
+        f = next(f for f in p["findings"] if f["kind"] == "EAV" and f["full"])
+        self.assertEqual(
+            {proof["locator"]["_rowid_"] for proof in f["proofs"]}, set(range(56, 62))
+        )
+        self.assert_replays(p)
+
+        with contextlib.closing(sqlite3.connect(self.source)) as con, con:
+            con.executescript("DROP INDEX by_value; DROP INDEX by_entity;")
+        for mode in ("bounded", "exhaustive"):
+            with self.subTest(unindexed_mode=mode):
+                p = self.run_finder("--mode", mode, "--witnesses", "2")
+                self.assertTrue(
+                    any(f["kind"] == "EAV" and f["full"] for f in p["findings"])
+                )
+                self.assert_replays(p)
+
+    def test_eav_partial_attribute_coverage(self):
+        self.prepare(
+            [
+                ("Gala GA-418", "red"),
+                ("Granny Smith", "green"),
+                ("Missing apple", "red"),
+            ],
+            "CREATE TABLE t(e,a,v); INSERT INTO t VALUES "
+            "('one','n','Gala GA-418'),('one','c','red'),"
+            "('two','n','Granny Smith'),('two','c','green');",
+        )
+        p = self.run_finder()
+        self.assertTrue(
+            any(
+                f["kind"] == "EAV" and f["matched_cells"] == 4 and not f["full"]
+                for f in p["findings"]
+            )
+        )
+        self.assert_replays(p)
+
+    def test_partial_column_mapping_replays_verified_cells(self):
+        self.prepare(
+            [("Gala GA-418", 2, 149), ("Granny Smith", 3, 398)],
+            "CREATE TABLE t(x,y); INSERT INTO t VALUES ('Gala GA-418',2),('Granny Smith',3);",
+        )
+        p = self.run_finder()
+        f = next(f for f in p["findings"] if f["kind"] == "rows")
+        self.assertEqual((f["matched_cells"], f["total_cells"]), (4, 6))
+        self.assert_replays(p)
+
+    def test_join_candidates_survive_many_earlier_category_tables(self):
+        self.prepare(
+            [("Gala GA-418", "red"), ("Granny Smith", "green")],
+            "".join(
+                f"CREATE TABLE a_noise_{i:02}(v); "
+                f"INSERT INTO a_noise_{i:02} VALUES ('red'),('green'); "
+                for i in range(30)
+            )
+            + "CREATE TABLE z_colors(k TEXT PRIMARY KEY, v); "
+            "INSERT INTO z_colors VALUES ('color-0001','red'),('color-0002','green'); "
+            "CREATE TABLE z_apples(x, k REFERENCES z_colors(k)); "
+            "INSERT INTO z_apples VALUES ('Gala GA-418','color-0001'),('Granny Smith','color-0002'); "
+            "CREATE INDEX apple_name ON z_apples(x); CREATE INDEX color_value ON z_colors(v);",
+        )
+        for declared in (True, False):
+            if not declared:
+                with contextlib.closing(sqlite3.connect(self.source)) as con, con:
+                    con.executescript(
+                        "ALTER TABLE z_apples RENAME TO old; "
+                        "CREATE TABLE z_apples AS SELECT * FROM old; DROP TABLE old;"
+                    )
+            with self.subTest(declared=declared):
+                p = self.run_finder("--candidates-per-column", "1")
+                f = next(
+                    f
+                    for f in p["findings"]
+                    if f["kind"] == "JOIN"
+                    and f["full"]
+                    and set(f["tables"]) == {"z_apples", "z_colors"}
+                )
+                self.assertEqual("Join inferred" in f["note"], not declared)
+                self.assert_replays(p)
+
+    def test_binary_index_preferred_to_nocase_on_same_column(self):
+        self.prepare(
+            [("Gala GA-418", "red"), ("Granny Smith", "green")],
+            "CREATE TABLE t(name TEXT COLLATE NOCASE, color);"
+            "CREATE INDEX binary_name ON t(name COLLATE BINARY);"
+            "CREATE INDEX nocase_name ON t(name);",
+            [
+                (
+                    "INSERT INTO t VALUES(?,?)",
+                    [
+                        ("GALA GA-418", "red"),
+                        ("GRANNY SMITH", "green"),
+                        ("Gala GA-418", "red"),
+                        ("Granny Smith", "green"),
+                    ],
+                )
+            ],
+        )
+        p = self.run_finder("--sample-rows", "0", "--witnesses", "1")
+        self.assertTrue(any(f["full"] for f in p["findings"]))
+        self.assert_replays(p)
+
+    def test_empty_tables_skip_samples_and_index_probes(self):
+        self.prepare(
+            [("A", 12), ("B", 23)],
+            "".join(
+                f"CREATE TABLE t{i}(x); CREATE INDEX ix{i} ON t{i}(x); "
+                for i in range(128)
+            ),
+        )
+        p = self.run_finder()
+        self.assertEqual(len(p["coverage"]), 128)
+        self.assertTrue(
+            all(c["empty"] and c["index_probes"] == 0 for c in p["coverage"])
+        )
+        self.assertLess(p["metadata"]["source_queries"], 150)
+
+    def test_table_limit_applies_after_source_filter_and_is_reported(self):
+        self.prepare(
+            [("Gala GA-418", "red"), ("Granny Smith", "green")],
+            "CREATE TABLE ignored(x); CREATE TABLE kept_a(a,b); CREATE TABLE kept_b(x); "
+            "INSERT INTO kept_a VALUES ('Gala GA-418','red'),('Granny Smith','green');",
+        )
+        p = self.run_finder("--max-tables", "1", "--table-pattern", "kept_*")
+        self.assertEqual([c["table"] for c in p["coverage"]], ["kept_a"])
+        self.assertTrue(any(f["full"] for f in p["findings"]))
+        self.assertTrue(
+            any("--max-tables" in n for n in p["metadata"]["operational_notes"])
+        )
+
+    def test_evidence_capacity_stops_later_discovery_queries(self):
+        self.prepare(
+            [("Gala GA-418", "red"), ("Granny Smith", "green")],
+            "CREATE TABLE first(a,b); CREATE INDEX ix ON first(a); "
+            "INSERT INTO first VALUES ('Gala GA-418','red'),('Granny Smith','green');"
+            "CREATE TABLE later AS SELECT * FROM first; CREATE INDEX ix2 ON later(a);",
+        )
+        p = self.run_finder("--max-evidence-rows", "1")
+        coverage = {c["table"]: c for c in p["coverage"]}
+        self.assertTrue(coverage["first"]["started"])
+        self.assertFalse(coverage["later"]["started"])
+        self.assertEqual(coverage["first"]["retained_rows"], 1)
+        self.assertTrue(
+            any("--max-evidence-rows" in n for n in p["metadata"]["operational_notes"])
+        )
 
     def test_alternative_transpose_mapping(self):
         # Lexically first full column-set assignment is wrong; the second is coherent.
