@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+/.venv/
+/.pytest_cache/
+
+# Generated datasets and run outputs; source, documentation, and tests stay tracked.
+/data/
+/reports/
+/logs/
+
+# Working files, including those written to custom output paths.
+*.sqlite
+*.sqlite-*
+*.building
+*.log
